@@ -17,8 +17,7 @@ export type CreatorPage = {
 };
 
 type CampaignRow = { niches_json: string };
-type CreatorRow = { id: string; name: string; niches_json: string };
-type ReachRow = { creator_id: string; latest_reach: number };
+type CreatorRow = { id: string; name: string; niches_json: string; latest_reach: number };
 type CountRow = { creator_id: string; n: number };
 
 function compareCreators(left: CreatorMatch, right: CreatorMatch): number {
@@ -39,25 +38,20 @@ export async function listCreators(
   if (!campaign) return null;
 
   const campaignNiches = JSON.parse(campaign.niches_json) as string[];
-  const creators = await all<CreatorRow>(db, "SELECT id, name, niches_json FROM creators");
-  const reaches = await all<ReachRow>(db, `
-    SELECT accounts.creator_id, SUM(metrics.views) AS latest_reach
-    FROM social_accounts AS accounts
-    JOIN (
-      SELECT account_id, views,
-        ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY captured_at DESC, id DESC) AS position
-      FROM metrics
-    ) AS metrics ON metrics.account_id = accounts.id AND metrics.position = 1
-    GROUP BY accounts.creator_id
+  const creators = await all<CreatorRow>(db, `
+    SELECT creators.id, creators.name, creators.niches_json,
+      COALESCE((
+        SELECT SUM((
+          SELECT views FROM metrics
+          WHERE account_id = accounts.id
+          ORDER BY captured_at DESC, id DESC
+          LIMIT 1
+        ))
+        FROM social_accounts AS accounts
+        WHERE accounts.creator_id = creators.id
+      ), 0) AS latest_reach
+    FROM creators
   `);
-  const deliveries = await all<CountRow>(db, `
-    SELECT creator_id, COUNT(*) AS n
-    FROM deliveries
-    WHERE delivered_at >= ?
-    GROUP BY creator_id
-  `, deliveriesSince());
-  const reachByCreator = new Map(reaches.map((row) => [row.creator_id, row.latest_reach]));
-  const deliveriesByCreator = new Map(deliveries.map((row) => [row.creator_id, row.n]));
   const scored: CreatorMatch[] = [];
 
   for (const creator of creators) {
@@ -74,15 +68,29 @@ export async function listCreators(
       id: creator.id,
       name: creator.name,
       niche_score: nicheScore,
-      latest_reach: reachByCreator.get(creator.id) ?? 0,
-      deliveries_90d: Number(deliveriesByCreator.get(creator.id) ?? 0),
+      latest_reach: creator.latest_reach,
+      deliveries_90d: 0,
     });
   }
 
   scored.sort(compareCreators);
+  const page = scored.slice(input.offset, input.offset + input.limit);
+  if (page.length > 0) {
+    const placeholders = page.map(() => "?").join(", ");
+    const deliveries = await all<CountRow>(db, `
+      SELECT creator_id, COUNT(*) AS n
+      FROM deliveries
+      WHERE creator_id IN (${placeholders}) AND delivered_at >= ?
+      GROUP BY creator_id
+    `, ...page.map((creator) => creator.id), deliveriesSince());
+    const deliveriesByCreator = new Map(deliveries.map((row) => [row.creator_id, row.n]));
+    for (const creator of page) {
+      creator.deliveries_90d = Number(deliveriesByCreator.get(creator.id) ?? 0);
+    }
+  }
   return {
     campaign_id: input.campaignId,
     total: scored.length,
-    creators: scored.slice(input.offset, input.offset + input.limit),
+    creators: page,
   };
 }
